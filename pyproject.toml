@@ -1,0 +1,37 @@
+[project]
+name = "screen-translator"
+version = "0.1.0"
+description = "English-to-Ukrainian screen translator for Windows"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "PySide6-Essentials>=6.9,<7",
+  "keyring>=25,<27",
+  "winrt-runtime>=3.2,<4",
+  "winrt-Windows.Foundation>=3.2,<4",
+  "winrt-Windows.Foundation.Collections>=3.2,<4",
+  "winrt-Windows.Globalization>=3.2,<4",
+  "winrt-Windows.Graphics.Imaging>=3.2,<4",
+  "winrt-Windows.Media.Ocr>=3.2,<4",
+  "winrt-Windows.Storage.Streams>=3.2,<4",
+]
+
+[project.optional-dependencies]
+dev = ["pyinstaller>=6.20,<7", "pytest>=8,<10", "ruff>=0.13,<1"]
+
+[project.scripts]
+screen-translator = "screen_translator.app:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/screen_translator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
