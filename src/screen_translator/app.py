@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -25,11 +26,14 @@ from PySide6.QtWidgets import (
 )
 
 from screen_translator.capture import CaptureOverlay, FloatingToggle
+from screen_translator.groq_translator import translate as translate_groq
 from screen_translator.ocr import recognize_png
-from screen_translator.translator import TranslationError, translate
+from screen_translator.translator import TranslationError
+from screen_translator.translator import translate as translate_azure
 
 KEYRING_SERVICE = "teremno-screen-translator"
-KEYRING_ACCOUNT = "azure-translator"
+AZURE_KEYRING_ACCOUNT = "azure-translator"
+GROQ_KEYRING_ACCOUNT = "groq"
 logger = logging.getLogger(__name__)
 
 
@@ -38,9 +42,10 @@ class TranslationWorker(QObject):
 
     completed = Signal(str, str, str)
 
-    def __init__(self, png: bytes, region: str):
+    def __init__(self, png: bytes, provider: str, region: str):
         super().__init__()
         self.png = png
+        self.provider = provider
         self.region = region
 
     @Slot()
@@ -50,15 +55,21 @@ class TranslationWorker(QObject):
             source = recognize_png(self.png)
             if not source:
                 raise TranslationError("No English text was found in the selected area.")
-            key = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT) or ""
-            target = translate(source, key, self.region)
+            if self.provider == "groq":
+                key = keyring.get_password(KEYRING_SERVICE, GROQ_KEYRING_ACCOUNT) or ""
+                target = translate_groq(source, key)
+            elif self.provider == "azure":
+                key = keyring.get_password(KEYRING_SERVICE, AZURE_KEYRING_ACCOUNT) or ""
+                target = translate_azure(source, key, self.region)
+            else:
+                raise TranslationError("Невідомий сервіс перекладу. Обери сервіс у налаштуваннях.")
             self.completed.emit(source, target, "")
         except TranslationError as exc:
             self.completed.emit(source, "", str(exc))
         except Exception as exc:  # noqa: BLE001 - redact all OCR and credential failure details
             # Do not include OCR text, screenshots, or credentials in errors.
-            logger.error("Recognition failed (%s)", type(exc).__name__)
-            self.completed.emit(source, "", "Screen recognition failed. Check Windows OCR settings.")
+            logger.error("Recognition or translation failed (%s)", type(exc).__name__)
+            self.completed.emit(source, "", "Помилка розпізнавання або перекладу. Перевір налаштування.")
 
 
 class ResultDialog(QDialog):
@@ -70,9 +81,9 @@ class ResultDialog(QDialog):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        self.status = QLabel("Recognizing English text…")
+        self.status = QLabel("Розпізнаю англійський текст…")
         layout.addWidget(self.status)
-        layout.addWidget(QLabel("English text recognized from screen:"))
+        layout.addWidget(QLabel("Англійський текст з екрана:"))
         self.source = QTextEdit()
         self.source.setReadOnly(True)
         self.source.setMaximumHeight(110)
@@ -93,26 +104,39 @@ class ResultDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """Collect the Azure key without displaying a stored secret."""
+    """Configure a translation provider without displaying stored secrets."""
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Налаштування перекладу")
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Використовуй ресурс Azure Translator тарифу F0."))
         form = QFormLayout()
+        self.provider = QComboBox()
+        self.provider.addItem("Groq Free Plan", "groq")
+        self.provider.addItem("Azure Translator F0", "azure")
+        saved_provider = str(settings.value("provider", "groq"))
+        self.provider.setCurrentIndex(max(0, self.provider.findData(saved_provider)))
+        self.provider.currentIndexChanged.connect(self._provider_changed)
+        form.addRow("Сервіс перекладу:", self.provider)
         self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
         self.key.setPlaceholderText("Новий ключ; порожнє поле збереже старий")
-        form.addRow("Azure key:", self.key)
+        self.key_label = QLabel()
+        form.addRow(self.key_label, self.key)
         self.region = QLineEdit(str(settings.value("azure_region", "")))
         self.region.setPlaceholderText("Лише для регіонального ресурсу")
-        form.addRow("Region:", self.region)
+        self.region_label = QLabel("Azure Region:")
+        form.addRow(self.region_label, self.region)
         layout.addLayout(form)
+        self.provider_info = QLabel()
+        self.provider_info.setWordWrap(True)
+        self.provider_info.setOpenExternalLinks(True)
+        layout.addWidget(self.provider_info)
         self.confirm_f0 = QCheckBox("Я перевірив, що мій ресурс Azure має безкоштовний тариф F0")
         self.confirm_f0.setChecked(bool(settings.value("confirmed_f0", False, type=bool)))
         layout.addWidget(self.confirm_f0)
+        self._provider_changed()
         buttons = QHBoxLayout()
         save_button = QPushButton("Зберегти")
         save_button.clicked.connect(self.save)
@@ -122,10 +146,27 @@ class SettingsDialog(QDialog):
         buttons.addWidget(cancel_button)
         layout.addLayout(buttons)
 
+    def _provider_changed(self) -> None:
+        is_azure = self.provider.currentData() == "azure"
+        self.key_label.setText("Azure key:" if is_azure else "Groq API key:")
+        self.region_label.setVisible(is_azure)
+        self.region.setVisible(is_azure)
+        self.confirm_f0.setVisible(is_azure)
+        if is_azure:
+            self.provider_info.setText("Azure потребує ресурсу Translator тарифу F0.")
+        else:
+            self.provider_info.setText(
+                'Створи ключ на <a href="https://console.groq.com/keys">console.groq.com/keys</a> '
+                "і залишайся на Groq Free Plan. Платний Developer може виставляти рахунки."
+            )
+
     def save(self) -> None:
         try:
+            provider = str(self.provider.currentData())
             if self.key.text().strip():
-                keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, self.key.text().strip())
+                account = GROQ_KEYRING_ACCOUNT if provider == "groq" else AZURE_KEYRING_ACCOUNT
+                keyring.set_password(KEYRING_SERVICE, account, self.key.text().strip())
+            self.settings.setValue("provider", provider)
             self.settings.setValue("azure_region", self.region.text().strip())
             self.settings.setValue("confirmed_f0", self.confirm_f0.isChecked())
             self.settings.sync()
@@ -232,16 +273,19 @@ class ScreenTranslator(QObject):
         self.result.finished.connect(self._result_closed)
         self.result.open()
 
-        if not self.settings.value("confirmed_f0", False, type=bool):
+        provider = str(self.settings.value("provider", "groq"))
+        if provider == "azure" and not self.settings.value("confirmed_f0", False, type=bool):
             self.result.show_result(
                 "",
                 "",
-                "Open Settings and confirm that your Azure resource uses the free F0 tier.",
+                "Відкрий налаштування та підтвердь безкоштовний тариф Azure F0.",
             )
             return
 
         self.thread = QThread()
-        self.worker = TranslationWorker(png, str(self.settings.value("azure_region", "")))
+        self.worker = TranslationWorker(
+            png, provider, str(self.settings.value("azure_region", ""))
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.completed.connect(self._translation_completed)
