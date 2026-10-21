@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QWidget
 class CaptureOverlay(QWidget):
     """Consume mouse drags on one screen and emit a PNG of the chosen region."""
 
-    captured = Signal(bytes, QPoint)
+    captured = Signal(bytes, QRect)
     cancelled = Signal()
 
     def __init__(self, screen, parent=None):
@@ -75,7 +75,9 @@ class CaptureOverlay(QWidget):
             self.cancelled.emit()
             return
         buffer.close()
-        self.captured.emit(bytes(data), self.mapToGlobal(selected.bottomRight()))
+        self.captured.emit(
+            bytes(data), QRect(self.mapToGlobal(selected.topLeft()), selected.size())
+        )
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:

@@ -34,9 +34,10 @@ def test_drag_returns_cropped_png() -> None:
     QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=QPoint(100, 55))
 
     assert spy.count() == 1
-    png, _position = spy.at(0)
+    png, selection = spy.at(0)
     image = QImage.fromData(png, "PNG")
     assert image.width() >= 80
     assert image.height() >= 40
     assert image.pixelColor(0, 0) == QColor("red")
+    assert selection == QRect(20, 15, 81, 41)
     overlay.close()

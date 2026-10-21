@@ -6,7 +6,18 @@ import logging
 import sys
 
 import keyring
-from PySide6.QtCore import QObject, QPoint, QSettings, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QObject,
+    QPoint,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -101,6 +112,33 @@ class ResultDialog(QDialog):
         self.source.setPlainText(source)
         self.target.setPlainText(target)
         self.status.setText(error or "Переклад готовий")
+
+
+def popup_position(selection: QRect, popup_size: QSize, available: QRect) -> QPoint:
+    """Place a result beside the selected area and keep it on the same screen."""
+    gap = 12
+    right = selection.right() + gap
+    left = selection.left() - popup_size.width() - gap
+    below = selection.bottom() + gap
+    above = selection.top() - popup_size.height() - gap
+
+    if right + popup_size.width() <= available.right() + 1:
+        candidate = QPoint(right, selection.top())
+    elif left >= available.left():
+        candidate = QPoint(left, selection.top())
+    elif below + popup_size.height() <= available.bottom() + 1:
+        candidate = QPoint(selection.left(), below)
+    elif above >= available.top():
+        candidate = QPoint(selection.left(), above)
+    else:
+        candidate = QPoint(selection.center().x(), selection.center().y())
+
+    max_x = max(available.left(), available.right() - popup_size.width() + 1)
+    max_y = max(available.top(), available.bottom() - popup_size.height() + 1)
+    return QPoint(
+        min(max(candidate.x(), available.left()), max_x),
+        min(max(candidate.y(), available.top()), max_y),
+    )
 
 
 class SettingsDialog(QDialog):
@@ -239,11 +277,14 @@ class ScreenTranslator(QObject):
             self._show_overlays()
         else:
             self._hide_overlays()
-            if self.result is not None:
-                self.result.close()
 
     def _show_overlays(self) -> None:
-        if not self.enabled or self.overlays or self.thread is not None:
+        if (
+            not self.enabled
+            or self.overlays
+            or self.thread is not None
+            or (self.result is not None and self.result.isVisible())
+        ):
             return
         for screen in self.app.screens():
             overlay = CaptureOverlay(screen)
@@ -265,13 +306,22 @@ class ScreenTranslator(QObject):
     def _cancel_capture(self) -> None:
         self.change_mode()
 
-    @Slot(bytes, QPoint)
-    def _capture(self, png: bytes, near: QPoint) -> None:
+    @Slot(bytes, QRect)
+    def _capture(self, png: bytes, selection: QRect) -> None:
         self._hide_overlays()
+        self.enabled = False
+        self.toggle.set_enabled(False)
+        self.mode_action.setText("Увімкнути")
         self.result = ResultDialog()
-        self.result.move(near + QPoint(12, 12))
         self.result.finished.connect(self._result_closed)
-        self.result.open()
+        self.result.show()
+        screen = self.app.screenAt(selection.center()) or self.app.primaryScreen()
+        if screen is not None:
+            self.result.move(
+                popup_position(selection, self.result.frameGeometry().size(), screen.availableGeometry())
+            )
+        self.result.raise_()
+        self.result.activateWindow()
 
         provider = str(self.settings.value("provider", "groq"))
         if provider == "azure" and not self.settings.value("confirmed_f0", False, type=bool):
@@ -312,9 +362,16 @@ class ScreenTranslator(QObject):
 
     @Slot(int)
     def _result_closed(self, _code: int) -> None:
-        self.result = None
+        # Qt is still returning from QDialog.close here. Release its Python owner
+        # on the next event-loop turn so the native widget remains alive meanwhile.
+        QTimer.singleShot(0, self._release_closed_result)
         if self.enabled:
             self._show_overlays()
+
+    def _release_closed_result(self) -> None:
+        if self.result is not None and not self.result.isVisible():
+            self.result.deleteLater()
+            self.result = None
 
     @Slot()
     def open_settings(self) -> None:
@@ -341,10 +398,12 @@ def main() -> int:
         from screen_translator.selftest import run_self_test
 
         return run_self_test()
-    ScreenTranslator(app)
+    controller = ScreenTranslator(app)
     if "--smoke-test" in sys.argv:
         QTimer.singleShot(500, app.quit)
-    return app.exec()
+    exit_code = app.exec()
+    controller.tray.hide()
+    return exit_code
 
 
 if __name__ == "__main__":
