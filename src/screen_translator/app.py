@@ -18,7 +18,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizeGrip,
     QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
@@ -48,18 +49,17 @@ GROQ_KEYRING_ACCOUNT = "groq"
 logger = logging.getLogger(__name__)
 
 
-class TranslationWorker(QObject):
-    """Run OCR and translation away from the Qt event loop."""
+class TranslationThread(QThread):
+    """Run one OCR and translation request without a worker event-loop race."""
 
     completed = Signal(str, str, str)
 
-    def __init__(self, png: bytes, provider: str, region: str):
-        super().__init__()
+    def __init__(self, png: bytes, provider: str, region: str, parent: QObject):
+        super().__init__(parent)
         self.png = png
         self.provider = provider
         self.region = region
 
-    @Slot()
     def run(self) -> None:
         source = ""
         try:
@@ -86,27 +86,92 @@ class TranslationWorker(QObject):
 class ResultDialog(QDialog):
     """Display the OCR source alongside its Ukrainian translation."""
 
-    def __init__(self):
+    DEFAULT_FONT_POINTS = 14
+    MIN_FONT_POINTS = 10
+    MAX_FONT_POINTS = 28
+    DEFAULT_SIZE = QSize(720, 560)
+
+    def __init__(self, settings: QSettings):
         super().__init__()
-        self.setWindowTitle("Screen Translator")
+        self.settings = settings
+        self.font_points = max(
+            self.MIN_FONT_POINTS,
+            min(
+                self.MAX_FONT_POINTS,
+                settings.value("result_font_points", self.DEFAULT_FONT_POINTS, type=int),
+            ),
+        )
+        font = self.font()
+        font.setPointSize(self.font_points)
+        self.setFont(font)
+        self.setWindowTitle("Переклад екрана")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-        self.setMinimumWidth(420)
+        self.setMinimumSize(520, 390)
+        saved_size = settings.value("result_window_size")
+        self.resize(saved_size if isinstance(saved_size, QSize) else self.DEFAULT_SIZE)
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Розмір тексту:"))
+        self.smaller_button = QPushButton("A−")
+        self.smaller_button.setToolTip("Зменшити текст (Ctrl+-)")
+        self.smaller_button.setAccessibleName("Зменшити розмір тексту")
+        self.smaller_button.clicked.connect(lambda: self.change_text_size(-1))
+        controls.addWidget(self.smaller_button)
+        self.font_size_label = QLabel(f"{self.font_points} pt")
+        self.font_size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.font_size_label.setMinimumWidth(55)
+        controls.addWidget(self.font_size_label)
+        self.larger_button = QPushButton("A+")
+        self.larger_button.setToolTip("Збільшити текст (Ctrl++)")
+        self.larger_button.setAccessibleName("Збільшити розмір тексту")
+        self.larger_button.clicked.connect(lambda: self.change_text_size(1))
+        controls.addWidget(self.larger_button)
+        controls.addStretch()
+        layout.addLayout(controls)
         self.status = QLabel("Розпізнаю англійський текст…")
+        self.status.setWordWrap(True)
         layout.addWidget(self.status)
         layout.addWidget(QLabel("Англійський текст з екрана:"))
         self.source = QTextEdit()
         self.source.setReadOnly(True)
-        self.source.setMaximumHeight(110)
-        layout.addWidget(self.source)
+        self.source.setMinimumHeight(100)
+        layout.addWidget(self.source, 2)
         layout.addWidget(QLabel("Український переклад:"))
         self.target = QTextEdit()
         self.target.setReadOnly(True)
-        self.target.setMinimumHeight(100)
-        layout.addWidget(self.target)
+        self.target.setMinimumHeight(140)
+        layout.addWidget(self.target, 3)
+        footer = QHBoxLayout()
         close_button = QPushButton("Закрити")
+        close_button.setMinimumHeight(38)
         close_button.clicked.connect(self.close)
-        layout.addWidget(close_button)
+        footer.addWidget(close_button, 1)
+        footer.addWidget(QSizeGrip(self))
+        layout.addLayout(footer)
+
+        for key in ("Ctrl++", "Ctrl+="):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(lambda: self.change_text_size(1))
+        shortcut = QShortcut(QKeySequence("Ctrl+-"), self)
+        shortcut.activated.connect(lambda: self.change_text_size(-1))
+
+    def change_text_size(self, delta: int) -> None:
+        """Adjust all dialog text and remember the chosen point size."""
+        points = max(self.MIN_FONT_POINTS, min(self.MAX_FONT_POINTS, self.font_points + delta))
+        if points == self.font_points:
+            return
+        self.font_points = points
+        font = self.font()
+        font.setPointSize(points)
+        self.setFont(font)
+        self.font_size_label.setText(f"{points} pt")
+        self.settings.setValue("result_font_points", points)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.settings.setValue("result_window_size", self.size())
+        self.settings.sync()
+        super().closeEvent(event)
 
     def show_result(self, source: str, target: str, error: str) -> None:
         self.source.setPlainText(source)
@@ -240,8 +305,7 @@ class ScreenTranslator(QObject):
         self._quitting = False
         self.overlays: list[CaptureOverlay] = []
         self.result: ResultDialog | None = None
-        self.thread: QThread | None = None
-        self.worker: TranslationWorker | None = None
+        self.thread: TranslationThread | None = None
         self.toggle = FloatingToggle()
         self.toggle.toggled.connect(self.change_mode)
         self.toggle.context_requested.connect(self._show_context_menu)
@@ -312,13 +376,15 @@ class ScreenTranslator(QObject):
         self.enabled = False
         self.toggle.set_enabled(False)
         self.mode_action.setText("Увімкнути")
-        self.result = ResultDialog()
+        self.result = ResultDialog(self.settings)
         self.result.finished.connect(self._result_closed)
         self.result.show()
         screen = self.app.screenAt(selection.center()) or self.app.primaryScreen()
         if screen is not None:
+            available = screen.availableGeometry()
+            self.result.resize(self.result.size().boundedTo(available.size() - QSize(32, 48)))
             self.result.move(
-                popup_position(selection, self.result.frameGeometry().size(), screen.availableGeometry())
+                popup_position(selection, self.result.frameGeometry().size(), available)
             )
         self.result.raise_()
         self.result.activateWindow()
@@ -332,17 +398,11 @@ class ScreenTranslator(QObject):
             )
             return
 
-        self.thread = QThread()
-        self.worker = TranslationWorker(
-            png, provider, str(self.settings.value("azure_region", ""))
+        self.thread = TranslationThread(
+            png, provider, str(self.settings.value("azure_region", "")), self
         )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.completed.connect(self._translation_completed)
-        self.worker.completed.connect(self.thread.quit)
-        self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.completed.connect(self._translation_completed)
         self.thread.finished.connect(self._thread_finished)
-        self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
     @Slot(str, str, str)
@@ -352,8 +412,15 @@ class ScreenTranslator(QObject):
 
     @Slot()
     def _thread_finished(self) -> None:
+        # Keep the QThread wrapper alive until its finished signal has unwound.
+        QTimer.singleShot(0, self._release_finished_thread)
+
+    def _release_finished_thread(self) -> None:
+        thread = self.thread
+        if thread is None:
+            return
         self.thread = None
-        self.worker = None
+        thread.deleteLater()
         if self._quitting:
             self.app.quit()
             return

@@ -19,6 +19,8 @@ Azure Translator is optional. If using Azure, create a Translator **F0** resourc
 
 The floating button toggles capture mode and can be dragged to a new position. When capture mode is on, a frozen screen image accepts a left-button rectangle. The result window opens beside the selection on the same screen and stays open until you close it. The floating button switches to OFF after each capture; click it again when you want another translation.
 
+The result window starts at a readable size with 14 pt text. Use **A−** and **A+** (or `Ctrl+-` and `Ctrl++`) to change the text size. Drag a window edge or its bottom-right grip to resize the window. Both sizes are remembered for the next translation.
+
 Right-click the floating button, or use its system tray icon, to open Settings or quit. `Esc` cancels capture mode. Protected video, Windows secure desktop, and some elevated windows may not be capturable. Capture rectangles currently stay within one monitor; mixed-DPI and multiple monitors need a real desktop walkthrough.
 
 ## Build and install on Windows

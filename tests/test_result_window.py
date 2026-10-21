@@ -2,11 +2,41 @@
 
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import QPoint, QRect, QSettings, QSize
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSizeGrip
 
 from screen_translator import app as translator_app
+
+
+def test_result_font_and_window_size_are_readable_and_saved(tmp_path) -> None:
+    qapp = QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / "display.ini"), QSettings.Format.IniFormat)
+    dialog = translator_app.ResultDialog(settings)
+
+    assert dialog.size() == QSize(720, 560)
+    assert dialog.source.font().pointSize() == 14
+    assert dialog.target.font().pointSize() == 14
+    assert dialog.findChild(QSizeGrip) is not None
+
+    dialog.larger_button.click()
+    dialog.larger_button.click()
+    assert dialog.font_size_label.text() == "16 pt"
+    assert dialog.source.font().pointSize() == 16
+    assert dialog.target.font().pointSize() == 16
+    dialog.smaller_button.click()
+    assert dialog.source.font().pointSize() == 15
+
+    dialog.resize(810, 620)
+    dialog.show()
+    qapp.processEvents()
+    dialog.close()
+    reopened = translator_app.ResultDialog(settings)
+    assert reopened.size() == QSize(810, 620)
+    assert reopened.source.font().pointSize() == 15
+    reopened.close()
 
 
 def test_popup_stays_beside_selection_and_inside_screen() -> None:
@@ -32,10 +62,9 @@ def test_capture_turns_off_but_keeps_result_open_until_closed(monkeypatch, tmp_p
     monkeypatch.setattr(translator_app, "QSettings", lambda *_args: settings)
     monkeypatch.setattr(translator_app.ScreenTranslator, "_show_overlays", lambda _self: None)
 
-    def complete_without_network(worker) -> None:
-        worker.completed.emit("Hello", "Привіт", "")
-
-    monkeypatch.setattr(translator_app.TranslationWorker, "run", complete_without_network)
+    monkeypatch.setattr(translator_app, "recognize_png", lambda _png: "Hello")
+    monkeypatch.setattr(translator_app, "translate_groq", lambda _text, _key: "Привіт")
+    monkeypatch.setattr(translator_app.keyring, "get_password", lambda _service, _account: "test")
     controller = translator_app.ScreenTranslator(qapp)
     controller.change_mode()
     assert controller.enabled
@@ -47,7 +76,13 @@ def test_capture_turns_off_but_keeps_result_open_until_closed(monkeypatch, tmp_p
     assert controller.result is not None
     assert controller.result.isVisible()
 
-    QTest.qWait(100)
+    deadline = time.monotonic() + 5
+    while (
+        controller.thread is not None
+        or (controller.result is not None and controller.result.target.toPlainText() != "Привіт")
+    ) and time.monotonic() < deadline:
+        QTest.qWait(20)
+    assert controller.thread is None
     assert controller.result is not None
     assert controller.result.isVisible()
     assert controller.result.target.toPlainText() == "Привіт"
