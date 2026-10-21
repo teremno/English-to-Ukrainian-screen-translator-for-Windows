@@ -52,39 +52,38 @@ logger = logging.getLogger(__name__)
 class TranslationThread(QThread):
     """Run one OCR and translation request without a worker event-loop race."""
 
-    completed = Signal(str, str, str)
+    completed = Signal(str, str)
 
-    def __init__(self, png: bytes, provider: str, region: str, parent: QObject):
+    def __init__(self, png: bytes, provider: str, region: str, key: str, parent: QObject):
         super().__init__(parent)
         self.png = png
         self.provider = provider
         self.region = region
+        self.key = key
 
     def run(self) -> None:
         source = ""
         try:
             source = recognize_png(self.png)
             if not source:
-                raise TranslationError("No English text was found in the selected area.")
+                raise TranslationError("У вибраній ділянці не знайдено англійського тексту.")
             if self.provider == "groq":
-                key = keyring.get_password(KEYRING_SERVICE, GROQ_KEYRING_ACCOUNT) or ""
-                target = translate_groq(source, key)
+                target = translate_groq(source, self.key)
             elif self.provider == "azure":
-                key = keyring.get_password(KEYRING_SERVICE, AZURE_KEYRING_ACCOUNT) or ""
-                target = translate_azure(source, key, self.region)
+                target = translate_azure(source, self.key, self.region)
             else:
                 raise TranslationError("Невідомий сервіс перекладу. Обери сервіс у налаштуваннях.")
-            self.completed.emit(source, target, "")
+            self.completed.emit(target, "")
         except TranslationError as exc:
-            self.completed.emit(source, "", str(exc))
+            self.completed.emit("", str(exc))
         except Exception as exc:  # noqa: BLE001 - redact all OCR and credential failure details
             # Do not include OCR text, screenshots, or credentials in errors.
             logger.error("Recognition or translation failed (%s)", type(exc).__name__)
-            self.completed.emit(source, "", "Помилка розпізнавання або перекладу. Перевір налаштування.")
+            self.completed.emit("", "Помилка розпізнавання або перекладу. Перевір налаштування.")
 
 
 class ResultDialog(QDialog):
-    """Display the OCR source alongside its Ukrainian translation."""
+    """Display only the Ukrainian translation or a clear failure message."""
 
     DEFAULT_FONT_POINTS = 14
     MIN_FONT_POINTS = 10
@@ -129,19 +128,13 @@ class ResultDialog(QDialog):
         controls.addWidget(self.larger_button)
         controls.addStretch()
         layout.addLayout(controls)
-        self.status = QLabel("Розпізнаю англійський текст…")
+        self.status = QLabel("Розпізнаю та перекладаю…")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        layout.addWidget(QLabel("Англійський текст з екрана:"))
-        self.source = QTextEdit()
-        self.source.setReadOnly(True)
-        self.source.setMinimumHeight(100)
-        layout.addWidget(self.source, 2)
-        layout.addWidget(QLabel("Український переклад:"))
         self.target = QTextEdit()
         self.target.setReadOnly(True)
-        self.target.setMinimumHeight(140)
-        layout.addWidget(self.target, 3)
+        self.target.setMinimumHeight(260)
+        layout.addWidget(self.target, 1)
         footer = QHBoxLayout()
         close_button = QPushButton("Закрити")
         close_button.setMinimumHeight(38)
@@ -173,10 +166,13 @@ class ResultDialog(QDialog):
         self.settings.sync()
         super().closeEvent(event)
 
-    def show_result(self, source: str, target: str, error: str) -> None:
-        self.source.setPlainText(source)
-        self.target.setPlainText(target)
-        self.status.setText(error or "Переклад готовий")
+    def show_result(self, target: str, error: str) -> None:
+        self.target.setPlainText(error or target)
+        if error:
+            self.status.setText("Не вдалося перекласти")
+            self.status.show()
+        else:
+            self.status.hide()
 
 
 def popup_position(selection: QRect, popup_size: QSize, available: QRect) -> QPoint:
@@ -393,22 +389,29 @@ class ScreenTranslator(QObject):
         if provider == "azure" and not self.settings.value("confirmed_f0", False, type=bool):
             self.result.show_result(
                 "",
-                "",
                 "Відкрий налаштування та підтвердь безкоштовний тариф Azure F0.",
             )
             return
 
+        try:
+            account = GROQ_KEYRING_ACCOUNT if provider == "groq" else AZURE_KEYRING_ACCOUNT
+            key = keyring.get_password(KEYRING_SERVICE, account) or ""
+        except Exception as exc:  # noqa: BLE001 - platform credential stores vary
+            logger.error("Credential lookup failed (%s)", type(exc).__name__)
+            self.result.show_result("", "Не вдалося прочитати ключ із Windows Credential Manager.")
+            return
+
         self.thread = TranslationThread(
-            png, provider, str(self.settings.value("azure_region", "")), self
+            png, provider, str(self.settings.value("azure_region", "")), key, self
         )
         self.thread.completed.connect(self._translation_completed)
         self.thread.finished.connect(self._thread_finished)
         self.thread.start()
 
-    @Slot(str, str, str)
-    def _translation_completed(self, source: str, target: str, error: str) -> None:
+    @Slot(str, str)
+    def _translation_completed(self, target: str, error: str) -> None:
         if self.result is not None and self.result.isVisible():
-            self.result.show_result(source, target, error)
+            self.result.show_result(target, error)
 
     @Slot()
     def _thread_finished(self) -> None:
@@ -465,6 +468,14 @@ def main() -> int:
         from screen_translator.selftest import run_self_test
 
         return run_self_test()
+    if "--live-self-test" in sys.argv:
+        from screen_translator.selftest import run_live_self_test
+
+        try:
+            key = keyring.get_password(KEYRING_SERVICE, GROQ_KEYRING_ACCOUNT) or ""
+        except Exception:  # noqa: BLE001 - diagnostics expose only a process exit code
+            return 4
+        return run_live_self_test(key)
     controller = ScreenTranslator(app)
     if "--smoke-test" in sys.argv:
         QTimer.singleShot(500, app.quit)

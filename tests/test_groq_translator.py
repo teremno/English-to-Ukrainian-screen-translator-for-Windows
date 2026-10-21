@@ -41,6 +41,7 @@ def test_groq_receives_only_ocr_text(monkeypatch) -> None:
     assert seen["body"]["reasoning_effort"] == "low"
     assert seen["body"]["messages"][1] == {"role": "user", "content": "Hello, world!"}
     assert seen["headers"]["Authorization"] == "Bearer test-groq-key"
+    assert seen["headers"]["User-agent"] == groq_translator.USER_AGENT
     assert seen["timeout"] == 15
 
 
@@ -69,3 +70,12 @@ def test_groq_rejects_truncated_response(monkeypatch) -> None:
     monkeypatch.setattr(groq_translator, "urlopen", fake_open)
     with pytest.raises(TranslationError, match="обірвався"):
         groq_translator.translate("Hello", "test-groq-key")
+
+
+def test_cloudflare_block_is_not_misreported_as_a_bad_key(monkeypatch) -> None:
+    def fake_open(request, timeout):
+        raise HTTPError(request.full_url, 403, "blocked", {"Content-Type": "text/plain"}, None)
+
+    monkeypatch.setattr(groq_translator, "urlopen", fake_open)
+    with pytest.raises(TranslationError, match="Захист Groq заблокував запит"):
+        groq_translator.translate("Hello", "private-test-groq-key")
